@@ -1,14 +1,14 @@
-/*
- * Copyright (C) 2004-2009 Georgy Yunaev gyunaev@ulduzsoft.com
+/* 
+ * Copyright (C) 2004-2012 George Yunaev gyunaev@ulduzsoft.com
  *
- * This library is free software; you can redistribute it and/or modify it
- * under the terms of the GNU Lesser General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or (at your
+ * This library is free software; you can redistribute it and/or modify it 
+ * under the terms of the GNU Lesser General Public License as published by 
+ * the Free Software Foundation; either version 3 of the License, or (at your 
  * option) any later version.
  *
- * This library is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * This library is distributed in the hope that it will be useful, but WITHOUT 
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or 
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public 
  * License for more details.
  */
 
@@ -16,7 +16,8 @@
 #define LIBIRC_DCC_SENDFILE		2
 #define LIBIRC_DCC_RECVFILE		3
 
-irc_dcc_session_t * libirc_find_dcc_session (irc_session_t * session, irc_dcc_t dccid, int lock_list)
+
+static irc_dcc_session_t * libirc_find_dcc_session (irc_session_t * session, irc_dcc_t dccid, int lock_list)
 {
 	irc_dcc_session_t * s, *found = 0;
 
@@ -140,7 +141,7 @@ static void libirc_dcc_add_descriptors (irc_session_t * ircsession, fd_set *in_s
 			if ( len <= 0 )
 			{
 				int err = (len < 0 ? LIBIRC_ERR_READ : 0);
-
+			
 				libirc_mutex_unlock (&ircsession->mutex_dcc);
 
 				(*dcc->cb)(ircsession, dcc->id, err, dcc->ctx, 0, 0);
@@ -188,7 +189,7 @@ static void libirc_dcc_add_descriptors (irc_session_t * ircsession, fd_set *in_s
 		case LIBIRC_STATE_CONFIRM_SIZE:
 			/*
 			 * If we're receiving file, then WE should confirm the transferred
-             * part (so we have to sent data). But if we're sending the file,
+             * part (so we have to sent data). But if we're sending the file, 
              * then RECEIVER should confirm the packet, so we have to receive
              * data.
              *
@@ -232,14 +233,14 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
 			// On success, change the active socket and change the state
 			if ( err == 0 )
 			{
-				// close the listen socket, and replace it by a newly
+				// close the listen socket, and replace it by a newly 
 				// accepted
 				socket_close (&dcc->sock);
 				dcc->sock = nsock;
 				dcc->state = LIBIRC_STATE_CONNECTED;
 			}
 
-			// If this is DCC chat, inform the caller about accept()
+			// If this is DCC chat, inform the caller about accept() 
 			// success or failure.
 			// Otherwise (DCC send) there is no reason.
 			if ( dcc->dccmode == LIBIRC_DCC_CHAT )
@@ -256,7 +257,7 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
 		if ( dcc->state == LIBIRC_STATE_CONNECTING
 		&& FD_ISSET (dcc->sock, out_set) )
 		{
-			// Now we have to determine whether the socket is connected
+			// Now we have to determine whether the socket is connected 
 			// or the connect is failed
 			struct sockaddr_in saddr;
 			socklen_t slen = sizeof(saddr);
@@ -289,7 +290,7 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
 			if ( FD_ISSET (dcc->sock, in_set) )
 			{
 				int length, offset = 0, err = 0;
-
+		
 				unsigned int amount = sizeof (dcc->incoming_buf) - dcc->incoming_offset;
 
 				length = socket_recv (&dcc->sock, dcc->incoming_buf + dcc->incoming_offset, amount);
@@ -297,7 +298,7 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
 				if ( length < 0 )
 				{
 					err = LIBIRC_ERR_READ;
-				}
+				}	
 				else if ( length == 0 )
 				{
 					err = LIBIRC_ERR_CLOSED;
@@ -329,7 +330,9 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
 
 						if ( dcc->incoming_offset == 4 )
 						{
-							unsigned int received_size = ntohl (*((unsigned int*)dcc->incoming_buf));
+							// The order is big-endian
+							const unsigned char * bptr = (const unsigned char *) dcc->incoming_buf;
+							unsigned int received_size = (bptr[0] << 24) | (bptr[1] << 16) | (bptr[2] << 8)  | bptr[3];
 
 							// Sent size confirmed
 							if ( dcc->file_confirm_offset == received_size )
@@ -344,9 +347,9 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
 					else
 					{
 						/*
-						 * If it is DCC_CHAT, we send a 0-terminated string
+						 * If it is DCC_CHAT, we send a 0-terminated string 
 						 * (which is smaller than offset). Otherwise we send
-	                     * a full buffer.
+	                     * a full buffer. 
 	                     */
 						libirc_mutex_unlock (&ircsession->mutex_dcc);
 
@@ -365,7 +368,12 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
                              {
                              	dcc->state = LIBIRC_STATE_CONFIRM_SIZE;
                              	dcc->file_confirm_offset += offset;
-                             	*((unsigned int*)dcc->outgoing_buf) = htonl (dcc->file_confirm_offset);
+								
+								// Store as big endian
+								dcc->outgoing_buf[0] = (char) dcc->file_confirm_offset >> 24;
+								dcc->outgoing_buf[1] = (char) dcc->file_confirm_offset >> 16;
+								dcc->outgoing_buf[2] = (char) dcc->file_confirm_offset >> 8;
+								dcc->outgoing_buf[3] = (char) dcc->file_confirm_offset;
                              	dcc->outgoing_offset = 4;
 							}
 						}
@@ -375,14 +383,14 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
 						libirc_mutex_lock (&ircsession->mutex_dcc);
 
 						if ( dcc->incoming_offset - offset > 0 )
-							memmove (dcc->incoming_buf, dcc->incoming_buf + dcc->incoming_offset, dcc->incoming_offset - offset);
+							memmove (dcc->incoming_buf, dcc->incoming_buf + offset, dcc->incoming_offset - offset);
 
 						dcc->incoming_offset -= offset;
 					}
 				}
 
                 /*
-                 * If error arises somewhere above, we inform the caller
+                 * If error arises somewhere above, we inform the caller 
                  * of failure, and destroy this session.
                  */
 				if ( err )
@@ -395,7 +403,7 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
 			}
 
             /*
-             * Session might be closed (with sock = -1) after the in_set
+             * Session might be closed (with sock = -1) after the in_set 
              * processing, so before out_set processing we should check
              * for this case
 			 */
@@ -410,14 +418,14 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
 				int length, offset, err = 0;
 
 				/*
-				 * Because in some cases outgoing_buf could be changed
-				 * asynchronously (by another thread), we should lock
+				 * Because in some cases outgoing_buf could be changed 
+				 * asynchronously (by another thread), we should lock 
 				 * it.
                  */
 				libirc_mutex_lock (&dcc->mutex_outbuf);
 
 				offset = dcc->outgoing_offset;
-
+		
 				if ( offset > 0 )
 				{
 					length = socket_send (&dcc->sock, dcc->outgoing_buf, offset);
@@ -452,7 +460,7 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
 						dcc->outgoing_offset -= length;
 
 						/*
-						 * If we just sent the confirmation data, change state
+						 * If we just sent the confirmation data, change state 
 						 * back.
                          */
 						if ( dcc->state == LIBIRC_STATE_CONFIRM_SIZE
@@ -482,7 +490,7 @@ static void libirc_dcc_process_descriptors (irc_session_t * ircsession, fd_set *
 				libirc_mutex_unlock (&dcc->mutex_outbuf);
 
                 /*
-                 * If error arises somewhere above, we inform the caller
+                 * If error arises somewhere above, we inform the caller 
                  * of failure, and destroy this session.
                  */
 				if ( err )
@@ -516,23 +524,40 @@ static int libirc_new_dcc_session (irc_session_t * session, unsigned long ip, un
 	if ( libirc_mutex_init (&dcc->mutex_outbuf) )
 		goto cleanup_exit_error;
 
-	if ( socket_create (PF_INET, SOCK_STREAM, &dcc->sock, session->interface) )
+	if ( socket_create (PF_INET, SOCK_STREAM, &dcc->sock) )
 		goto cleanup_exit_error;
 
 	if ( !ip )
 	{
-		struct sockaddr_in saddr;
 		unsigned long arg = 1;
 
 		setsockopt (dcc->sock, SOL_SOCKET, SO_REUSEADDR, (char*)&arg, sizeof(arg));
 
-		memset (&saddr, 0, sizeof(saddr));
-		saddr.sin_family = AF_INET;
-		memcpy (&saddr.sin_addr, &session->local_addr, sizeof(session->local_addr));
-		saddr.sin_port = htons (port);
+#if defined (ENABLE_IPV6)
+		if ( session->flags & SESSIONFL_USES_IPV6 )
+		{
+			struct sockaddr_in6 saddr6;
 
-		if ( bind (dcc->sock, (struct sockaddr *) &saddr, sizeof(saddr)) < 0 )
-			goto cleanup_exit_error;
+			memset (&saddr6, 0, sizeof(saddr6));
+			saddr6.sin6_family = AF_INET6;
+			memcpy (&saddr6.sin6_addr, &session->local_addr6, sizeof(session->local_addr6));
+			saddr6.sin6_port = htons (0);
+
+			if ( bind (dcc->sock, (struct sockaddr *) &saddr6, sizeof(saddr6)) < 0 )
+				goto cleanup_exit_error;
+		}
+		else
+#endif
+		{
+			struct sockaddr_in saddr;
+			memset (&saddr, 0, sizeof(saddr));
+			saddr.sin_family = AF_INET;
+			memcpy (&saddr.sin_addr, &session->local_addr, sizeof(session->local_addr));
+			saddr.sin_port = htons (0);
+
+			if ( bind (dcc->sock, (struct sockaddr *) &saddr, sizeof(saddr)) < 0 )
+				goto cleanup_exit_error;
+		}
 
 		if ( listen (dcc->sock, 5) < 0 )
 			goto cleanup_exit_error;
@@ -598,7 +623,7 @@ int irc_dcc_destroy (irc_session_t * session, irc_dcc_t dccid)
 }
 
 
-int	irc_dcc_chat (irc_session_t * session, void * ctx, const char * nick, const char * ip, unsigned short port, irc_dcc_callback_t callback, irc_dcc_t * dccid)
+int	irc_dcc_chat (irc_session_t * session, void * ctx, const char * nick, irc_dcc_callback_t callback, irc_dcc_t * dccid)
 {
 	struct sockaddr_in saddr;
 	socklen_t len = sizeof(saddr);
@@ -612,7 +637,7 @@ int	irc_dcc_chat (irc_session_t * session, void * ctx, const char * nick, const 
 		return 1;
 	}
 
-	err = libirc_new_dcc_session (session, 0, port, LIBIRC_DCC_CHAT, ctx, &dcc);
+	err = libirc_new_dcc_session (session, 0, 0, LIBIRC_DCC_CHAT, ctx, &dcc);
 
 	if ( err )
 	{
@@ -627,16 +652,8 @@ int	irc_dcc_chat (irc_session_t * session, void * ctx, const char * nick, const 
 		return 1;
 	}
 
-	char *ipAddr;
-
-	if (ip && strlen(ip))
-		ipAddr = ip;
-	else
-		ipAddr = inet_ntoa(saddr.sin_addr);
-
-		sprintf (notbuf, "DCC Chat (%s)", ipAddr);
-		sprintf (cmdbuf, "DCC CHAT chat %lu %u", ntohl(inet_addr(ipAddr)), 
-				ntohs (saddr.sin_port));
+	sprintf (notbuf, "DCC Chat (%s)", inet_ntoa (saddr.sin_addr));
+	sprintf (cmdbuf, "DCC CHAT chat %lu %u", (unsigned long) ntohl (saddr.sin_addr.s_addr), ntohs (saddr.sin_port));
 
 	if ( irc_cmd_notice (session, nick, notbuf)
 	|| irc_cmd_ctcp_request (session, nick, cmdbuf) )
@@ -707,8 +724,8 @@ static void libirc_dcc_request (irc_session_t * session, const char * nick, cons
 				return;
 			}
 
-			(*session->callbacks.event_dcc_chat_req) (session,
-						nick,
+			(*session->callbacks.event_dcc_chat_req) (session, 
+						nick, 
 						inet_ntoa (dcc->remote_addr.sin_addr),
 						dcc->id);
 		}
@@ -728,8 +745,8 @@ static void libirc_dcc_request (irc_session_t * session, const char * nick, cons
 				return;
 			}
 
-			(*session->callbacks.event_dcc_send_req) (session,
-						nick,
+			(*session->callbacks.event_dcc_send_req) (session, 
+						nick, 
 						inet_ntoa (dcc->remote_addr.sin_addr),
 						filenamebuf,
 						size,

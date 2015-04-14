@@ -1,70 +1,45 @@
-/*
- * Copyright (C) 2004-2009 Georgy Yunaev gyunaev@ulduzsoft.com
+/* 
+ * Copyright (C) 2004-2012 George Yunaev gyunaev@ulduzsoft.com
  *
- * This library is free software; you can redistribute it and/or modify it
- * under the terms of the GNU Lesser General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or (at your
+ * This library is free software; you can redistribute it and/or modify it 
+ * under the terms of the GNU Lesser General Public License as published by 
+ * the Free Software Foundation; either version 3 of the License, or (at your 
  * option) any later version.
  *
- * This library is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * This library is distributed in the hope that it will be useful, but WITHOUT 
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or 
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public 
  * License for more details.
  */
+
+#define IS_DEBUG_ENABLED(s)	((s)->options & LIBIRC_OPTION_DEBUG)
 
 #include "portable.c"
 #include "sockets.c"
 
 #include "libircclient.h"
-#include "libirc_session.h"
+#include "session.h"
 
 #include "utils.c"
 #include "errors.c"
 #include "colors.c"
 #include "dcc.c"
+#include "ssl.c"
+
 
 #ifdef _MSC_VER
-/*
-
- * The debugger of MSVC 2005 does not like strdup.
- * It complains about heap corruption when free is called.
- * Use _strdup instead.
- */
-#undef strdup
-#define strdup _strdup
+	/*
+	 * The debugger of MSVC 2005 does not like strdup.
+	 * It complains about heap corruption when free is called.
+	 * Use _strdup instead.
+	 */
+	#undef strdup
+	#define strdup _strdup
 #endif
 
-char *
-strnstr(s, find, slen)
-const char *s;
-const char *find;
-size_t slen;
+
+irc_session_t * irc_create_session (irc_callbacks_t	* callbacks)
 {
-	char c, sc;
-	size_t len;
-
-	if ((c = *find++) != '\0') {
-		len = strlen(find);
-		do {
-			do {
-				if ((sc = *s++) == '\0' || slen-- < 1)
-					return (NULL);
-			} while (sc != c);
-			if (len > slen)
-				return (NULL);
-		} while (strncmp(s, find, len) != 0);
-		s--;
-	}
-	return ((char *)s);
-}
-
-
-
-#define IS_DEBUG_ENABLED(s)	((s)->options & LIBIRC_OPTION_DEBUG)
-
-
-irc_session_t * irc_create_session (irc_callbacks_t	* callbacks, const char * interface)
-				{
 	irc_session_t * session = malloc (sizeof(irc_session_t));
 
 	if ( !session )
@@ -74,7 +49,7 @@ irc_session_t * irc_create_session (irc_callbacks_t	* callbacks, const char * in
 	session->sock = -1;
 
 	if ( libirc_mutex_init (&session->mutex_session)
-			|| libirc_mutex_init (&session->mutex_dcc) )
+	|| libirc_mutex_init (&session->mutex_dcc) )
 	{
 		free (session);
 		return 0;
@@ -83,23 +58,16 @@ irc_session_t * irc_create_session (irc_callbacks_t	* callbacks, const char * in
 	session->dcc_last_id = 1;
 	session->dcc_timeout = 60;
 
-	if (interface != NULL)
-		session->interface = strdup(interface);
-
 	memcpy (&session->callbacks, callbacks, sizeof(irc_callbacks_t));
 
 	if ( !session->callbacks.event_ctcp_req )
 		session->callbacks.event_ctcp_req = libirc_event_ctcp_internal;
 
 	return session;
-				}
+}
 
-
-void irc_destroy_session (irc_session_t * session)
+static void free_ircsession_strings (irc_session_t * session)
 {
-	if ( session->sock >= 0 )
-		socket_close (&session->sock);
-
 	if ( session->realname )
 		free (session->realname);
 
@@ -115,12 +83,35 @@ void irc_destroy_session (irc_session_t * session)
 	if ( session->server_password )
 		free (session->server_password);
 
+	session->realname = 0;
+	session->username = 0;
+	session->nick = 0;
+	session->server = 0;
+	session->server_password = 0;
+}
+
+void irc_destroy_session (irc_session_t * session)
+{
+	free_ircsession_strings( session );
+
+	// The CTCP VERSION must be freed only now
+	if ( session->ctcp_version )
+		free (session->ctcp_version);
+	
+	if ( session->sock >= 0 )
+		socket_close (&session->sock);
+
 #if defined (ENABLE_THREADS)
 	libirc_mutex_destroy (&session->mutex_session);
 #endif
 
-	/*
-	 * delete DCC data
+#if defined (ENABLE_SSL)
+	if ( session->ssl )
+		SSL_free( session->ssl );
+#endif
+	
+	/* 
+	 * delete DCC data 
 	 * libirc_remove_dcc_session removes the DCC session from the list.
 	 */
 	while ( session->dcc_sessions )
@@ -129,50 +120,17 @@ void irc_destroy_session (irc_session_t * session)
 	free (session);
 }
 
-#if defined (USE_SSL)
-/**
- * This info right now is getting dumped to syslog but might be something that
- * should get piped back into wIRC at some point.
- */
-void apps_ssl_info_callback(SSL *s, int where, int ret) {
-	const char *str;
-	int w;
-	w=where& ~SSL_ST_MASK;
-	if (w & SSL_ST_CONNECT) str="SSL_connect";
-	else if (w & SSL_ST_ACCEPT) str="SSL_accept";
-	else str="undefined";
-	if (where & SSL_CB_LOOP) {
-		syslog(LOG_INFO, "%s:%s\n",str,SSL_state_string_long(s));
-	}
-	else if (where & SSL_CB_ALERT) {
-		str=(where & SSL_CB_READ)?"read":"write";
-		syslog(LOG_INFO, "SSL3 alert %s:%s:%s\n",
-				str,
-				SSL_alert_type_string_long(ret),
-				SSL_alert_desc_string_long(ret));
-	}
-	else if (where & SSL_CB_EXIT) {
-		if (ret == 0)
-			syslog(LOG_INFO, "%s:failed in %s\n",
-					str,SSL_state_string_long(s));
-		else if (ret < 0) {
-			syslog(LOG_INFO, "%s:error in %s\n",
-					str,SSL_state_string_long(s));
-		}
-	}
-}
-#endif
 
 int irc_connect (irc_session_t * session,
-		const char * server,
-		unsigned short port,
-		unsigned int encryption,
-		const char * server_password,
-		const char * nick,
-		const char * username,
-		const char * realname)
+			const char * server, 
+			unsigned short port,
+			const char * server_password,
+			const char * nick,
+			const char * username,
+			const char * realname)
 {
 	struct sockaddr_in saddr;
+	char * p;
 
 	// Check and copy all the specified fields
 	if ( !server || !nick )
@@ -187,6 +145,21 @@ int irc_connect (irc_session_t * session,
 		return 1;
 	}
 
+	// Free the strings if defined; may be the case when the session is reused after the connection fails
+	free_ircsession_strings( session );
+
+	// Handle the server # prefix (SSL)
+	if ( server[0] == SSL_PREFIX )
+	{
+#if defined (ENABLE_SSL)
+		server++;
+		session->flags |= SESSIONFL_SSL_CONNECTION;
+#else
+		session->lasterror = LIBIRC_ERR_SSL_NOT_SUPPORTED;
+		return 1;
+#endif
+	}
+	
 	if ( username )
 		session->username = strdup (username);
 
@@ -199,26 +172,32 @@ int irc_connect (irc_session_t * session,
 	session->nick = strdup (nick);
 	session->server = strdup (server);
 
-	session->encryption = encryption;
+	// If port number is zero and server contains the port, parse it
+	if ( port == 0 && (p = strchr( session->server, ':' )) != 0 )
+	{
+		// Terminate the string and parse the port number
+		*p++ = '\0';
+		port = atoi( p );
+	}
 
 	// IPv4 address resolving
 	memset( &saddr, 0, sizeof(saddr) );
 	saddr.sin_family = AF_INET;
-	saddr.sin_port = htons (port);
-	saddr.sin_addr.s_addr = inet_addr (server);
+	saddr.sin_port = htons (port);		
+	saddr.sin_addr.s_addr = inet_addr( session->server );
 
-	if ( saddr.sin_addr.s_addr == INADDR_NONE )
-	{
+    if ( saddr.sin_addr.s_addr == INADDR_NONE )
+    {
 		struct hostent *hp;
 #if defined HAVE_GETHOSTBYNAME_R
 		int tmp_errno;
 		struct hostent tmp_hostent;
 		char buf[2048];
 
-		if ( gethostbyname_r (server, &tmp_hostent, buf, sizeof(buf), &hp, &tmp_errno) )
-			hp = 0;
+      	if ( gethostbyname_r (session->server, &tmp_hostent, buf, sizeof(buf), &hp, &tmp_errno) )
+      		hp = 0;
 #else
-		hp = gethostbyname (server);
+      	hp = gethostbyname (session->server);
 #endif // HAVE_GETHOSTBYNAME_R
 		if ( !hp )
 		{
@@ -227,61 +206,62 @@ int irc_connect (irc_session_t * session,
 		}
 
 		memcpy (&saddr.sin_addr, hp->h_addr, (size_t) hp->h_length);
-	}
+    }
 
-	// create the IRC server socket
-	if ( socket_create( PF_INET, SOCK_STREAM, &session->sock, session->interface) )
+    // create the IRC server socket
+	if ( socket_create( PF_INET, SOCK_STREAM, &session->sock)
+	|| socket_make_nonblocking (&session->sock) )
 	{
 		session->lasterror = LIBIRC_ERR_SOCKET;
 		return 1;
 	}
 
-	// and connect to the IRC server
-	if ( socket_connect (&session->sock, (struct sockaddr *) &saddr, sizeof(saddr)) )
+#if defined (ENABLE_SSL)
+	// Init the SSL stuff
+	if ( session->flags & SESSIONFL_SSL_CONNECTION )
 	{
-		session->lasterror = LIBIRC_ERR_CONNECT;
-		return 1;
-	}
-
-#if defined (USE_SSL)
-	// do encryption shit here
-	if (session->encryption == LIBIRC_ENCRYPTION_SSL || session->encryption == LIBIRC_ENCRYPTION_TLS) {
-		SSL_load_error_strings();
-		SSL_library_init();
-		if (session->encryption == LIBIRC_ENCRYPTION_SSL)
-			session->sslContext = SSL_CTX_new(SSLv23_client_method());
-		else if (session->encryption == LIBIRC_ENCRYPTION_TLS)
-			session->sslContext = SSL_CTX_new(TLSv1_client_method());
-		SSL_CTX_set_info_callback(session->sslContext, (void*)apps_ssl_info_callback);
-		SSL_CTX_set_verify(session->sslContext, SSL_VERIFY_NONE, NULL);
-		session->sslHandle = SSL_new(session->sslContext);
-		SSL_set_fd(session->sslHandle, (int)session->sock);
-		if (SSL_connect(session->sslHandle) <= 0) return 1;
+		int rc = ssl_init( session );
+		
+		if ( rc != 0 )
+		{
+			session->lasterror = rc;
+			return 1;
+		}
 	}
 #endif
+	
+    // and connect to the IRC server
+    if ( socket_connect (&session->sock, (struct sockaddr *) &saddr, sizeof(saddr)) )
+    {
+    	session->lasterror = LIBIRC_ERR_CONNECT;
+		return 1;
+    }
 
-	socket_make_nonblocking (&session->sock);
-
-	session->state = LIBIRC_STATE_CONNECTING;
-	session->motd_received = 0; // reset in case of reconnect
+    session->state = LIBIRC_STATE_CONNECTING;
+    session->flags = SESSIONFL_USES_IPV6; // reset in case of reconnect
 	return 0;
 }
 
 
 int irc_connect6 (irc_session_t * session,
-		const char * server,
-		unsigned short port,
-		const char * server_password,
-		const char * nick,
-		const char * username,
-		const char * realname)
+			const char * server, 
+			unsigned short port,
+			const char * server_password,
+			const char * nick,
+			const char * username,
+			const char * realname)
 {
 #if defined (ENABLE_IPV6)
 	struct sockaddr_in6 saddr;
 	struct addrinfo ainfo, *res = NULL;
-	char portStr[32];
-
-	sprintf(portStr, "%u", (unsigned)port);
+	char portStr[32], *p;
+#if defined (_WIN32)
+	int addrlen = sizeof(saddr);
+	HMODULE hWsock;
+	getaddrinfo_ptr_t getaddrinfo_ptr;
+	freeaddrinfo_ptr_t freeaddrinfo_ptr;
+	int resolvesuccess = 0;
+#endif
 
 	// Check and copy all the specified fields
 	if ( !server || !nick )
@@ -296,6 +276,21 @@ int irc_connect6 (irc_session_t * session,
 		return 1;
 	}
 
+	// Free the strings if defined; may be the case when the session is reused after the connection fails
+	free_ircsession_strings( session );
+
+	// Handle the server # prefix (SSL)
+	if ( server[0] == SSL_PREFIX )
+	{
+#if defined (ENABLE_SSL)
+		server++;
+		session->flags |= SESSIONFL_SSL_CONNECTION;
+#else
+		session->lasterror = LIBIRC_ERR_SSL_NOT_SUPPORTED;
+		return 1;
+#endif
+	}
+	
 	if ( username )
 		session->username = strdup (username);
 
@@ -308,56 +303,113 @@ int irc_connect6 (irc_session_t * session,
 	session->nick = strdup (nick);
 	session->server = strdup (server);
 
+	// If port number is zero and server contains the port, parse it
+	if ( port == 0 && (p = strchr( session->server, ':' )) != 0 )
+	{
+		// Terminate the string and parse the port number
+		*p++ = '\0';
+		port = atoi( p );
+	}
+	
 	memset( &saddr, 0, sizeof(saddr) );
 	saddr.sin6_family = AF_INET6;
-	saddr.sin6_port = htons (port);
+	saddr.sin6_port = htons (port);	
+	
+	sprintf( portStr, "%u", (unsigned)port );
 
-	if ( inet_pton( AF_INET6, server, (void*) &saddr.sin6_addr ) <= 0 )
+#if defined (_WIN32)
+	if ( WSAStringToAddressA( (LPSTR)session->server, AF_INET6, NULL, (struct sockaddr *)&saddr, &addrlen ) == SOCKET_ERROR )
 	{
+		hWsock = LoadLibraryA("ws2_32");
+
+		if (hWsock)
+		{
+			/* Determine functions at runtime, because windows systems < XP do not
+			 * support getaddrinfo. */
+			getaddrinfo_ptr = (getaddrinfo_ptr_t)GetProcAddress(hWsock, "getaddrinfo");
+			freeaddrinfo_ptr = (freeaddrinfo_ptr_t)GetProcAddress(hWsock, "freeaddrinfo");
+
+			if (getaddrinfo_ptr && freeaddrinfo_ptr)
+			{
+				memset(&ainfo, 0, sizeof(ainfo));
+				ainfo.ai_family = AF_INET6;
+				ainfo.ai_socktype = SOCK_STREAM;
+				ainfo.ai_protocol = 0;
+
+				if ( getaddrinfo_ptr(session->server, portStr, &ainfo, &res) == 0 && res )
+				{
+					resolvesuccess = 1;
+					memcpy( &saddr, res->ai_addr, res->ai_addrlen );
+					freeaddrinfo_ptr( res );
+				}
+			}
+			FreeLibrary(hWsock);
+		}
+		if (!resolvesuccess)
+		{
+			session->lasterror = LIBIRC_ERR_RESOLV;
+			return 1;
+		}
+	}
+#else
+	if ( inet_pton( AF_INET6, session->server, (void*) &saddr.sin6_addr ) <= 0 )
+	{		
 		memset( &ainfo, 0, sizeof(ainfo) );
 		ainfo.ai_family = AF_INET6;
 		ainfo.ai_socktype = SOCK_STREAM;
 		ainfo.ai_protocol = 0;
 
-		if ( getaddrinfo( server, portStr, &ainfo, &res ) || !res )
+		if ( getaddrinfo( session->server, portStr, &ainfo, &res ) || !res )
 		{
 			session->lasterror = LIBIRC_ERR_RESOLV;
 			return 1;
 		}
-
+		
 		memcpy( &saddr, res->ai_addr, res->ai_addrlen );
 		freeaddrinfo( res );
 	}
-
+#endif
+	
 	// create the IRC server socket
 	if ( socket_create( PF_INET6, SOCK_STREAM, &session->sock)
-			|| socket_make_nonblocking (&session->sock) )
+	|| socket_make_nonblocking (&session->sock) )
 	{
 		session->lasterror = LIBIRC_ERR_SOCKET;
 		return 1;
 	}
 
-	// and connect to the IRC server
-	if ( socket_connect (&session->sock, (struct sockaddr *) &saddr, sizeof(saddr)) )
+#if defined (ENABLE_SSL)
+	// Init the SSL stuff
+	if ( session->flags & SESSIONFL_SSL_CONNECTION )
 	{
-		session->lasterror = LIBIRC_ERR_CONNECT;
-		return 1;
+		int rc = ssl_init( session );
+		
+		if ( rc != 0 )
+			return rc;
 	}
+#endif
+	
+    // and connect to the IRC server
+    if ( socket_connect (&session->sock, (struct sockaddr *) &saddr, sizeof(saddr)) )
+    {
+    	session->lasterror = LIBIRC_ERR_CONNECT;
+		return 1;
+    }
 
-	session->state = LIBIRC_STATE_CONNECTING;
-	session->motd_received = 0; // reset in case of reconnect
+    session->state = LIBIRC_STATE_CONNECTING;
+    session->flags = 0; // reset in case of reconnect
 	return 0;
-#else /*we have no ipv6*/
+#else
 	session->lasterror = LIBIRC_ERR_NOIPV6;
 	return 1;
-#endif /*end IPv6*/
+#endif	
 }
 
 
 int irc_is_connected (irc_session_t * session)
 {
-	return (session->state == LIBIRC_STATE_CONNECTED
-			|| session->state == LIBIRC_STATE_CONNECTING) ? 1 : 0;
+	return (session->state == LIBIRC_STATE_CONNECTED 
+	|| session->state == LIBIRC_STATE_CONNECTING) ? 1 : 0;
 }
 
 
@@ -375,10 +427,7 @@ int irc_run (irc_session_t * session)
 		fd_set in_set, out_set;
 		int maxfd = 0;
 
-		if (session->state == LIBIRC_STATE_CONNECTING)
-			tv.tv_usec = 5000000;
-		else
-			tv.tv_usec = 250000;
+		tv.tv_usec = 250000;
 		tv.tv_sec = 0;
 
 		// Init sets
@@ -406,9 +455,9 @@ int irc_run (irc_session_t * session)
 
 int irc_add_select_descriptors (irc_session_t * session, fd_set *in_set, fd_set *out_set, int * maxfd)
 {
-	if ( session->sock < 0
-			|| session->state == LIBIRC_STATE_INIT
-			|| session->state == LIBIRC_STATE_DISCONNECTED )
+	if ( session->sock < 0 
+	|| session->state == LIBIRC_STATE_INIT
+	|| session->state == LIBIRC_STATE_DISCONNECTED )
 	{
 		session->lasterror = LIBIRC_ERR_STATE;
 		return 1;
@@ -425,11 +474,13 @@ int irc_add_select_descriptors (irc_session_t * session, fd_set *in_set, fd_set 
 
 	case LIBIRC_STATE_CONNECTED:
 		// Add input descriptor if there is space in input buffer
-		if ( session->incoming_offset < (sizeof (session->incoming_buf) - 1) )
+		if ( session->incoming_offset < (sizeof (session->incoming_buf) - 1) 
+		|| (session->flags & SESSIONFL_SSL_WRITE_WANTS_READ) != 0 )
 			libirc_add_to_set (session->sock, in_set, maxfd);
 
 		// Add output descriptor if there is something in output buffer
-		if ( libirc_findcrlf (session->outgoing_buf, session->outgoing_offset) > 0 )
+		if ( libirc_findcrlf (session->outgoing_buf, session->outgoing_offset) > 0
+		|| (session->flags & SESSIONFL_SSL_READ_WANTS_WRITE) != 0 )
 			libirc_add_to_set (session->sock, out_set, maxfd);
 
 		break;
@@ -444,11 +495,11 @@ int irc_add_select_descriptors (irc_session_t * session, fd_set *in_set, fd_set 
 
 static void libirc_process_incoming_data (irc_session_t * session, size_t process_length)
 {
-#define MAX_PARAMS_ALLOWED 10
+	#define MAX_PARAMS_ALLOWED 10
 	char buf[2*512], *p, *s;
 	const char * command = 0, *prefix = 0, *params[MAX_PARAMS_ALLOWED+1];
 	int code = 0, paramindex = 0;
-	char *buf_end = buf + process_length;
+    char *buf_end = buf + process_length;
 
 	if ( process_length > sizeof(buf) )
 		abort(); // should be impossible
@@ -459,8 +510,8 @@ static void libirc_process_incoming_data (irc_session_t * session, size_t proces
 	memset ((char *)params, 0, sizeof(params));
 	p = buf;
 
-	/*
-	 * From RFC 1459:
+    /*
+     * From RFC 1459:
 	 *  <message>  ::= [':' <prefix> <SPACE> ] <command> <params> <crlf>
 	 *  <prefix>   ::= <servername> | <nick> [ '!' <user> ] [ '@' <host> ]
 	 *  <command>  ::= <letter> { <letter> } | <number> <number> <number>
@@ -470,7 +521,7 @@ static void libirc_process_incoming_data (irc_session_t * session, size_t proces
 	 *                 or NUL or CR or LF, the first of which may not be ':'>
 	 *  <trailing> ::= <Any, possibly *empty*, sequence of octets not including
 	 *                   NUL or CR or LF>
-	 */
+ 	 */
 
 	// Parse <prefix>
 	if ( buf[0] == ':' )
@@ -483,7 +534,7 @@ static void libirc_process_incoming_data (irc_session_t * session, size_t proces
 		// we use buf+1 to skip the leading colon
 		prefix = buf + 1;
 
-		// If LIBIRC_OPTION_STRIPNICKS is set, we should 'clean up' nick
+		// If LIBIRC_OPTION_STRIPNICKS is set, we should 'clean up' nick 
 		// right here
 		if ( session->options & LIBIRC_OPTION_STRIPNICKS )
 		{
@@ -549,11 +600,11 @@ static void libirc_process_incoming_data (irc_session_t * session, size_t proces
 	// and dump
 	if ( code )
 	{
-		// We use session->motd_received to check whether it is the first
+		// We use SESSIONFL_MOTD_RECEIVED flag to check whether it is the first
 		// RPL_ENDOFMOTD or ERR_NOMOTD after the connection.
-		if ( (code == 376 || code == 422) && !session->motd_received )
+		if ( (code == 1 || code == 376 || code == 422) && !(session->flags & SESSIONFL_MOTD_RECEIVED ) )
 		{
-			session->motd_received = 1;
+			session->flags |= SESSIONFL_MOTD_RECEIVED;
 
 			if ( session->callbacks.event_connect )
 				(*session->callbacks.event_connect) (session, "CONNECT", prefix, params, paramindex);
@@ -568,7 +619,7 @@ static void libirc_process_incoming_data (irc_session_t * session, size_t proces
 		{
 			/*
 			 * If we're changed our nick, we should save it.
-			 */
+             */
 			char nickbuf[256];
 
 			irc_target_get_nick (prefix, nickbuf, sizeof(nickbuf));
@@ -626,11 +677,11 @@ static void libirc_process_incoming_data (irc_session_t * session, size_t proces
 		else if ( !strncmp (command, "PRIVMSG", buf_end - command) )
 		{
 			if ( paramindex > 1 )
-			{
+			{ 
 				size_t msglen = strlen (params[1]);
 
-				/*
-				 * Check for CTCP request (a CTCP message starts from 0x01
+				/* 
+				 * Check for CTCP request (a CTCP message starts from 0x01 
 				 * and ends by 0x01
 				 */
 				if ( params[1][0] == 0x01 && params[1][msglen-1] == 0x01 )
@@ -644,10 +695,10 @@ static void libirc_process_incoming_data (irc_session_t * session, size_t proces
 					memcpy (ctcp_buf, params[1] + 1, msglen);
 					ctcp_buf[msglen] = '\0';
 
-					if ( strnstr(ctcp_buf, "DCC ", msglen) == ctcp_buf )
+					if ( !strncasecmp(ctcp_buf, "DCC ", 4) )
 						libirc_dcc_request (session, prefix, ctcp_buf);
-					else if ( strnstr(ctcp_buf, "ACTION ", msglen) == ctcp_buf
-							&& session->callbacks.event_ctcp_action )
+					else if ( !strncasecmp( ctcp_buf, "ACTION ", 7)
+					&& session->callbacks.event_ctcp_action )
 					{
 						params[1] = ctcp_buf + 7; // the length of "ACTION "
 						paramindex = 2;
@@ -666,12 +717,12 @@ static void libirc_process_incoming_data (irc_session_t * session, size_t proces
 				else if ( !strncasecmp (params[0], session->nick, strlen(session->nick) ) )
 				{
 					if ( session->callbacks.event_privmsg )
-						(*session->callbacks.event_privmsg) (session, command, prefix, params, paramindex);
+						(*session->callbacks.event_privmsg) (session, "PRIVMSG", prefix, params, paramindex);
 				}
 				else
 				{
 					if ( session->callbacks.event_channel )
-						(*session->callbacks.event_channel) (session, command, prefix, params, paramindex);
+						(*session->callbacks.event_channel) (session, "CHANNEL", prefix, params, paramindex);
 				}
 			}
 		}
@@ -679,10 +730,10 @@ static void libirc_process_incoming_data (irc_session_t * session, size_t proces
 		{
 			size_t msglen = strlen (params[1]);
 
-			/*
-			 * Check for CTCP request (a CTCP message starts from 0x01
+			/* 
+			 * Check for CTCP request (a CTCP message starts from 0x01 
 			 * and ends by 0x01
-			 */
+             */
 			if ( paramindex > 1 && params[1][0] == 0x01 && params[1][msglen-1] == 0x01 )
 			{
 				char ctcp_buf[512];
@@ -718,11 +769,11 @@ static void libirc_process_incoming_data (irc_session_t * session, size_t proces
 		{
 			; /* ignore this event - not all servers generate this */
 		}
-		else
-		{
+	 	else
+	 	{
 			/*
-			 * The "unknown" event is triggered upon receipt of any number of
-			 * unclassifiable miscellaneous messages, which aren't handled by
+			 * The "unknown" event is triggered upon receipt of any number of 
+			 * unclassifiable miscellaneous messages, which aren't handled by 
 			 * the library.
 			 */
 
@@ -737,29 +788,29 @@ int irc_process_select_descriptors (irc_session_t * session, fd_set *in_set, fd_
 {
 	char buf[256], hname[256];
 
-	if ( session->sock < 0
-			|| session->state == LIBIRC_STATE_INIT
-			|| session->state == LIBIRC_STATE_DISCONNECTED )
+	if ( session->sock < 0 
+	|| session->state == LIBIRC_STATE_INIT
+	|| session->state == LIBIRC_STATE_DISCONNECTED )
 	{
 		session->lasterror = LIBIRC_ERR_STATE;
 		return 1;
 	}
 
+	session->lasterror = 0;
 	libirc_dcc_process_descriptors (session, in_set, out_set);
 
 	// Handle "connection succeed" / "connection failed"
-	if ( session->state == LIBIRC_STATE_CONNECTING
-			&& FD_ISSET (session->sock, out_set) )
+	if ( session->state == LIBIRC_STATE_CONNECTING 
+	&& FD_ISSET (session->sock, out_set) )
 	{
-		//syslog(LOG_INFO, "We are in process_select_descriptions handle connection area\n");
-		// Now we have to determine whether the socket is connected
+		// Now we have to determine whether the socket is connected 
 		// or the connect is failed
 		struct sockaddr_storage saddr, laddr;
 		socklen_t slen = sizeof(saddr);
 		socklen_t llen = sizeof(laddr);
 
 		if ( getsockname (session->sock, (struct sockaddr*)&laddr, &llen) < 0
-				|| getpeername (session->sock, (struct sockaddr*)&saddr, &slen) < 0 )
+		|| getpeername (session->sock, (struct sockaddr*)&saddr, &slen) < 0 )
 		{
 			// connection failed
 			session->lasterror = LIBIRC_ERR_CONNECT;
@@ -780,58 +831,49 @@ int irc_process_select_descriptors (irc_session_t * session, fd_set *in_set, fd_
 		session->state = LIBIRC_STATE_CONNECTED;
 
 		// Get the hostname
-		if ( gethostname (hname, sizeof(hname)) < 0 )
-			strcpy (hname, "unknown");
+    	if ( gethostname (hname, sizeof(hname)) < 0 )
+    		strcpy (hname, "unknown");
 
 		// Prepare the data, which should be sent to the server
 		if ( session->server_password )
 		{
 			snprintf (buf, sizeof(buf), "PASS %s", session->server_password);
-			irc_send_raw (session, "%s", buf);
+			irc_send_raw (session, buf);
 		}
 
 		snprintf (buf, sizeof(buf), "NICK %s", session->nick);
-		irc_send_raw (session, "%s", buf);
+		irc_send_raw (session, buf);
 
 		/*
-		 * RFC 1459 states that "hostname and servername are normally
-		 * ignored by the IRC server when the USER command comes from
-		 * a directly connected client (for security reasons)", therefore
-		 * we don't need them.
-		 */
-		snprintf (buf, sizeof(buf), "USER %s unknown unknown :%s",
+		 * RFC 1459 states that "hostname and servername are normally 
+         * ignored by the IRC server when the USER command comes from 
+         * a directly connected client (for security reasons)", therefore 
+         * we don't need them.
+         */
+		snprintf (buf, sizeof(buf), "USER %s unknown unknown :%s", 
 				session->username ? session->username : "nobody",
-						session->realname ? session->realname : "noname");
-		irc_send_raw (session, "%s", buf);
+				session->realname ? session->realname : "noname");
+		irc_send_raw (session, buf);
 
 		return 0;
 	}
 
 	if ( session->state != LIBIRC_STATE_CONNECTED )
+	{
+		session->lasterror = LIBIRC_ERR_STATE;
 		return 1;
+	}
 
 	// Hey, we've got something to read!
 	if ( FD_ISSET (session->sock, in_set) )
 	{
-		int length, offset;
+		int offset, length = session_socket_read( session );
 
-		unsigned int amount = (sizeof (session->incoming_buf) - 1) - session->incoming_offset;
-
-		switch (session->encryption) {
-		case LIBIRC_ENCRYPTION_NONE:
-			length = socket_recv (&session->sock, session->incoming_buf + session->incoming_offset, amount);
-			break;
-#if defined (USE_SSL)
-		case LIBIRC_ENCRYPTION_SSL:
-			length = ssl_socket_recv (session->sslHandle, session->incoming_buf + session->incoming_offset, amount);
-			break;
-#endif
-		}
-
-
-		if ( length <= 0 )
+		if ( length < 0 )
 		{
-			session->lasterror = (length == 0 ? LIBIRC_ERR_CLOSED : LIBIRC_ERR_TERMINATED);
+			if ( session->lasterror == 0 )
+				session->lasterror = (length == 0 ? LIBIRC_ERR_CLOSED : LIBIRC_ERR_TERMINATED);
+			
 			session->state = LIBIRC_STATE_DISCONNECTED;
 			return 1;
 		}
@@ -849,7 +891,7 @@ int irc_process_select_descriptors (irc_session_t * session, fd_set *in_set, fd_
 			libirc_process_incoming_data (session, offset);
 
 			offset = libirc_findcrlf_offset(session->incoming_buf, offset, session->incoming_offset);
-
+			
 			if ( session->incoming_offset - offset > 0 )
 				memmove (session->incoming_buf, session->incoming_buf + offset, session->incoming_offset - offset);
 
@@ -862,23 +904,15 @@ int irc_process_select_descriptors (irc_session_t * session, fd_set *in_set, fd_
 	{
 		int length;
 
-		// Because outgoing_buf could be changed asynchronously, we should
-		// lock any change
+		// Because outgoing_buf could be changed asynchronously, we should lock any change
 		libirc_mutex_lock (&session->mutex_session);
-		switch (session->encryption) {
-		case LIBIRC_ENCRYPTION_NONE:
-			length = socket_send (&session->sock, session->outgoing_buf, session->outgoing_offset);
-			break;
-#if defined (USE_SSL)
-		case LIBIRC_ENCRYPTION_SSL:
-			length = ssl_socket_send (session->sslHandle, session->outgoing_buf, session->outgoing_offset);
-			break;
-#endif
-		}
+		length = session_socket_write( session );
 
-		if ( length <= 0 )
+		if ( length < 0 )
 		{
-			session->lasterror = (length == 0 ? LIBIRC_ERR_CLOSED : LIBIRC_ERR_TERMINATED);
+			if ( session->lasterror == 0 )
+				session->lasterror = (length == 0 ? LIBIRC_ERR_CLOSED : LIBIRC_ERR_TERMINATED);
+
 			session->state = LIBIRC_STATE_DISCONNECTED;
 
 			libirc_mutex_unlock (&session->mutex_session);
@@ -890,7 +924,7 @@ int irc_process_select_descriptors (irc_session_t * session, fd_set *in_set, fd_
 			libirc_dump_data ("SEND", session->outgoing_buf, length);
 #endif
 
-		if ( session->outgoing_offset - length > 0 )
+		if ( length > 0 && session->outgoing_offset - length > 0 )
 			memmove (session->outgoing_buf, session->outgoing_buf + length, session->outgoing_offset - length);
 
 		session->outgoing_offset -= length;
@@ -956,7 +990,7 @@ int irc_cmd_join (irc_session_t * session, const char * channel, const char * ke
 }
 
 
-int irc_cmd_part (irc_session_t * session, const char * channel, const char * message)
+int irc_cmd_part (irc_session_t * session, const char * channel)
 {
 	if ( !channel )
 	{
@@ -964,10 +998,7 @@ int irc_cmd_part (irc_session_t * session, const char * channel, const char * me
 		return 1;
 	}
 
-	if ( message )
-		return irc_send_raw (session, "PART %s :%s", channel, message);
-	else
-		return irc_send_raw (session, "PART %s", channel);
+	return irc_send_raw (session, "PART %s", channel);
 }
 
 
@@ -1119,7 +1150,7 @@ int irc_cmd_ctcp_reply (irc_session_t * session, const char * nick, const char *
 void irc_get_version (unsigned int * high, unsigned int * low)
 {
 	*high = LIBIRC_VERSION_HIGH;
-	*low = LIBIRC_VERSION_LOW;
+    *low = LIBIRC_VERSION_LOW;
 }
 
 
@@ -1130,26 +1161,24 @@ void irc_set_ctx (irc_session_t * session, void * ctx)
 
 
 void * irc_get_ctx (irc_session_t * session)
-				{
+{
 	return session->ctx;
-				}
+}
+
+
+void irc_set_ctcp_version (irc_session_t * session, const char * version)
+{
+	if ( session->ctcp_version )
+		free(session->ctcp_version);
+
+	session->ctcp_version = strdup(version);
+}
 
 
 void irc_disconnect (irc_session_t * session)
 {
 	if ( session->sock >= 0 )
 		socket_close (&session->sock);
-
-#if defined (USE_SSL)
-	if (session->encryption == LIBIRC_ENCRYPTION_SSL) {
-		if (session->sslHandle) {
-			SSL_shutdown (session->sslHandle);
-			SSL_free (session->sslHandle);
-		}
-		if (session->sslContext)
-			SSL_CTX_free(session->sslContext);
-	}
-#endif
 
 	session->sock = -1;
 	session->state = LIBIRC_STATE_INIT;
